@@ -1,6 +1,7 @@
 package main
 
 import (
+	"crypto/md5"
 	"encoding/json"
 	"fmt"
 	"io/ioutil"
@@ -10,15 +11,11 @@ import (
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
+	"github.com/gomodule/redigo/redis"
 )
 
-var zhNewsSummary []StdNews
-var ttNewsSummary []StdNews
-var wyNewsSummary []StdNews
-var zhNewsContent [][]string
-var ttNewsContent [][]string
-var wyNewsContent [][]string
-var newsMap map[string][][]string
+var newsSummary map[string][]StdNews
+var newsContent map[string][][]string
 
 //create a mapping for es data storing
 // const mapping = `
@@ -116,7 +113,7 @@ func ZHToStd(news ZongHeNewsRaw) {
 		item.Body = each.Description
 		item.URL = each.URL
 		item.PicURL = each.PicURL
-		zhNewsSummary = append(zhNewsSummary, item)
+		newsSummary["ZHNews"] = append(newsSummary["ZHNews"], item)
 	}
 
 }
@@ -132,7 +129,7 @@ func TTToStd(news TouTiaoNewsRaw) {
 		item.Body = each.Description
 		item.URL = each.URL
 		item.PicURL = each.PicURL
-		ttNewsSummary = append(ttNewsSummary, item)
+		newsSummary["TTNews"] = append(newsSummary["TTNews"], item)
 	}
 }
 
@@ -152,9 +149,16 @@ func WYToStd(news WangYiNewsRaw) {
 		item.Body = each.Digest
 		item.URL = each.URL
 		item.PicURL = each.Imgsrc
-		wyNewsSummary = append(wyNewsSummary, item)
+		newsSummary["WYNews"] = append(newsSummary["WYNews"], item)
 	}
 
+}
+
+func checkError(msg string, err error) {
+	if err != nil {
+		fmt.Println(msg, err)
+		os.Exit(1)
+	}
 }
 
 /////数据接入/////
@@ -164,29 +168,21 @@ func GetZongHeNews() {
 	url := "http://api.tianapi.com/generalnews/index?key=d9455e812137a7cd7c9ab10229c34ec6" //ZHNews url
 	resp, err := http.Get(url)                                                             //接口接入、get返回示例
 
-	if err != nil {
-		fmt.Printf("Failed to fetch news", err)
-	}
+	checkError("Failed to fetch news", err)
 
 	body, err := ioutil.ReadAll(resp.Body) //转成可读形式(json)
 	resp.Body.Close()                      //断开连接
 
-	if err != nil {
-		fmt.Printf("Failed to read news", err)
-	}
+	checkError("Failed to read news", err)
 
 	/////格式转换/////
 	var zongheNews ZongHeNewsRaw                    //创造object
 	err = json.Unmarshal([]byte(body), &zongheNews) //json转换到go
-	if err != nil {
-		fmt.Println("Failed to unmarshal json", err)
-	}
+	checkError("Failed to unmarshal json", err)
 	ZHToStd(zongheNews) //转换到标准格式
 
 	/////正文爬取/////
-	GetNewsContent(zhNewsSummary, 1)
-	newsMap = make(map[string][][]string)
-	newsMap["ZHNews"] = zhNewsContent
+	GetNewsContent(newsSummary["ZHNews"], 1)
 
 }
 
@@ -195,29 +191,21 @@ func GetTouTiaoNews() {
 	url := "http://api.tianapi.com/topnews/index?key=d9455e812137a7cd7c9ab10229c34ec6"
 	resp, err := http.Get(url) //接口接入、get返回示例
 
-	if err != nil {
-		fmt.Printf("Failed to fetch news", err)
-	}
+	checkError("Failed to fetch news", err)
 
 	body, err := ioutil.ReadAll(resp.Body) //转成可读形式
 	resp.Body.Close()                      //断开连接
 
-	if err != nil {
-		fmt.Printf("Failed to read news", err)
-	}
+	checkError("Failed to read news", err)
 
 	/////格式转换/////
 	var toutiaoNews TouTiaoNewsRaw //创造object
 	err = json.Unmarshal([]byte(body), &toutiaoNews)
-	if err != nil {
-		fmt.Println("Failed to unmarshal json", err)
-	}
+	checkError("Failed to unmarshal json", err)
 	TTToStd(toutiaoNews) //转换到标准格式
 
 	/////正文爬取/////
-	GetNewsContent(ttNewsSummary, 3)
-	newsMap = make(map[string][][]string)
-	newsMap["TTNews"] = ttNewsContent
+	GetNewsContent(newsSummary["TTNews"], 3)
 
 }
 
@@ -242,9 +230,7 @@ func GetWangYiNews() {
 	for _, url := range urls {
 		resp, err := http.Get(url) //接口接入、get返回示例
 
-		if err != nil {
-			fmt.Printf("Failed to fetch news", err)
-		}
+		checkError("Failed to fetch news", err)
 
 		body, err := ioutil.ReadAll(resp.Body) //转成可读形式(json)
 		resp.Body.Close()                      //断开连接
@@ -252,22 +238,17 @@ func GetWangYiNews() {
 		bodyCut := bodyStr[9 : len(bodyStr)-1]
 		bodyJSON := []byte(bodyCut)
 
-		if err != nil {
-			fmt.Printf("Failed to read news", err)
-		}
+		checkError("Failed to read news", err)
 
 		/////格式转换/////
 		var wangyiNews WangYiNewsRaw                        //创造object
 		err = json.Unmarshal([]byte(bodyJSON), &wangyiNews) //json转换到go
-		if err != nil {
-			fmt.Println("Failed to unmarshal json", err)
-		}
+		checkError("Failed to unmarshal json", err)
 		WYToStd(wangyiNews) //转换到标准格式
-
-		/////正文爬取/////
-		GetNewsContent(wyNewsSummary, 2)
-		newsMap["WYNews"] = wyNewsContent
 	}
+
+	/////正文爬取/////
+	GetNewsContent(newsSummary["WYNews"], 2)
 
 }
 
@@ -281,18 +262,16 @@ func GetNewsContent(news []StdNews, id int) {
 		if err == nil {
 			body, _ := ioutil.ReadAll(resp.Body) //get html body
 			resp.Body.Close()
-
-			respStr := string(body)                                    //change html into string
-			chineseContent := chineseRegExp.FindAllString(respStr, -1) //find all the chinese content
+			chineseContent := chineseRegExp.FindAllString(string(body), -1) //find all the chinese content
 
 			if id == 1 {
-				zhNewsContent = append(zhNewsContent, chineseContent)
+				newsContent["ZHNews"] = append(newsContent["ZHNews"], chineseContent)
 				WriteToFile(each, chineseContent) //write news info and content into file
 			} else if id == 2 {
-				wyNewsContent = append(wyNewsContent, chineseContent)
+				newsContent["WYNews"] = append(newsContent["WYNews"], chineseContent)
 				WriteToFile(each, chineseContent) //write news info and content into file
 			} else {
-				ttNewsContent = append(ttNewsContent, []string{each.Body})
+				newsContent["WYNews"] = append(newsContent["WYNews"], []string{each.Body})
 				WriteToFile(each, []string{each.Body}) //write news info and content into file
 			}
 		}
@@ -304,9 +283,7 @@ func WriteToFile(news StdNews, content []string) {
 	f, _ := os.OpenFile("newsData.txt", os.O_WRONLY|os.O_APPEND, 0600)
 	data, err := json.Marshal(news)
 
-	if err != nil {
-		fmt.Println("Failed to marshal news", err)
-	}
+	checkError("Failed to marshal news", err)
 
 	f.Write(data) //write marshaled news info in json format
 	f.WriteString("\n")
@@ -322,16 +299,13 @@ func WriteToFile(news StdNews, content []string) {
 //DeliverMsgToKafka sends message to brokers with distinct topics
 func DeliverMsgToKafka(topic string) {
 	//access data stored in [newsContent]
-	data := newsMap[topic]
+	data := newsContent[topic]
 
 	//initiate a new producer
 	producer, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "127.0.0.1:9092"})
 
 	//check for successful creation of producer before proceeding
-	if err != nil {
-		fmt.Printf("Failed to create producer: %s\n", err) //error message
-		os.Exit(1)
-	}
+	checkError("Failed to create producer: %s\n", err)
 
 	/////WRITES MESSAGE/////
 
@@ -378,12 +352,13 @@ func ConsumeMsgFromKafka(topic string) {
 		"auto.offset.reset": "earliest",
 	})
 
-	if err != nil {
-		fmt.Printf("Failed to create consumer: %s\n", err)
-	}
+	checkError("Failed to create consumer: %s\n", err)
 
 	//controls topic fetched
 	consumer.SubscribeTopics([]string{topic, "^aRegex.*[Tt]opic"}, nil)
+	//connect to redis
+	conn, err := redis.Dial("tcp", "127.0.0.1:6379")
+	checkError("Failed to connect to redis", err)
 
 	for {
 		//consumer poll message
@@ -392,10 +367,30 @@ func ConsumeMsgFromKafka(topic string) {
 			fmt.Printf("Consumer error: %v (%v)\n", err, msg)
 		} else {
 			fmt.Printf("Message on %s: %s\n", msg.TopicPartition, string(msg.Value))
+			ProcessMsg(string(msg.Value), conn)
 		}
 	}
 
+	fmt.Println(redis.Strings(conn.Do("KEYS", "*")))
+
 	consumer.Close()
+	conn.Close()
+}
+
+//ProcessMsg 使用 redis 对新闻内容实现了去重
+func ProcessMsg(msg string, conn redis.Conn) {
+
+	data := md5.Sum([]byte(msg))    //convert according to md5
+	keyP := fmt.Sprintf("%x", data) //key to be set in redis
+
+	ret, err := conn.Do("EXISTS", keyP) //check if [keyP] exists
+	checkError("Failed to check key", err)
+
+	if exist, ok := ret.(int64); ok && exist == 1 {
+		_, err := conn.Do("SET", keyP, "")
+		checkError("Failed to set key "+keyP, err)
+	}
+
 }
 
 // func StoreInES(string indexName)(bool){
@@ -446,23 +441,26 @@ func ConsumeMsgFromKafka(topic string) {
 
 func main() {
 
+	newsSummary = make(map[string][]StdNews)  //initiate [newsSummary]
+	newsContent = make(map[string][][]string) //initiate [newsContent]
+
 	//set up news
 	//GetZongHeNews()
-	GetTouTiaoNews()
-	//GetWangYiNews()
+	//GetTouTiaoNews()
+	GetWangYiNews()
 
 	//store data in elasticsearch
 	//go StoreInES()
 
 	//deliver msg
 	//DeliverMsgToKafka("ZHNews")
-	DeliverMsgToKafka("TTNews")
-	//DeliverMsgToKafka("WYNews")
+	//DeliverMsgToKafka("TTNews")
+	DeliverMsgToKafka("WYNews")
 
 	//fetch msg
 	//ConsumeMsgFromKafka("ZHNews")
-	ConsumeMsgFromKafka("TTNews")
-	//ConsumeMsgFromKafka("WYNews")
+	//ConsumeMsgFromKafka("TTNews")
+	ConsumeMsgFromKafka("WYNews")
 
 	// fmt.Printf("%+v\n", GetZongHeNews())
 	// fmt.Printf("\n")
