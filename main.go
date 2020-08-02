@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/md5"
 	"encoding/json"
 	"fmt"
@@ -8,38 +9,66 @@ import (
 	"net/http"
 	"os"
 	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/confluentinc/confluent-kafka-go/kafka"
 	"github.com/gomodule/redigo/redis"
+	"gopkg.in/olivere/elastic.v7"
 )
 
 var newsSummary map[string][]StdNews
 var newsContent map[string][][]string
 
 //create a mapping for es data storing
+
 // const mapping = `
-// 	{
-// 		"mappings": {
-// 			"properties": {
-// 				"ctime": {
-// 					"type": "text"
-// 				},
-// 				"title": {
-// 					"type": "text"
-// 				},
-// 				"description": {
-// 					"type": "text"
-// 				}
-// 				"url": {
-// 					"type": "text"
-// 				}
-// 				"source": {
-// 					"type": "text"
-// 				}
+// {
+// 	"mappings": {
+// 		"properties": {
+// 			"timestamp": {
+// 				"type": "text"
+// 			},
+// 			"source": {
+// 				"type": "text"
+// 			},
+// 			"title": {
+// 				"type": "text"
+// 			}
+// 			"body": {
+// 				"type": "text"
+// 			}
+// 			"picurl": {
+// 				"type": "text"
+// 			}
+// 			"url": {
+// 				"type": "text"
+// 			}
+// 			"types": {
+// 				"type": "keyword"
+// 			}
+// 			"keywords": {
+// 				"type": "keyword"
 // 			}
 // 		}
-// 	}`
+// 	}
+// }`
+const mapping = `
+{
+    "mappings": {
+        "properties": {
+            "id": {
+                "type": "long"
+            },
+            "title": {
+                "type": "text"
+            },
+            "genres": {
+                "type": "keyword"
+            }
+        }
+    }
+}`
 
 /////数据归一化/////
 
@@ -248,7 +277,7 @@ func GetWangYiNews() {
 	}
 
 	/////正文爬取/////
-	GetNewsContent(newsSummary["WYNews"], 2)
+	//GetNewsContent(newsSummary["WYNews"], 2)
 
 }
 
@@ -299,7 +328,8 @@ func WriteToFile(news StdNews, content []string) {
 //DeliverMsgToKafka sends message to brokers with distinct topics
 func DeliverMsgToKafka(topic string) {
 	//access data stored in [newsContent]
-	data := newsContent[topic]
+	//data := newsContent[topic]
+	data := [][]string{[]string{topic}}
 
 	//initiate a new producer
 	producer, err := kafka.NewProducer(&kafka.ConfigMap{"bootstrap.servers": "127.0.0.1:9092"})
@@ -366,19 +396,21 @@ func ConsumeMsgFromKafka(topic string) {
 		if err != nil {
 			fmt.Printf("Consumer error: %v (%v)\n", err, msg)
 		} else {
-			fmt.Printf("Message on %s: %s\n", msg.TopicPartition, string(msg.Value))
-			ProcessMsg(string(msg.Value), conn)
+			value := string(msg.Value)
+			//msgList = append(msgList, value)
+			// if ProcessMsg(value, conn) {
+			// 	fmt.Printf("Message on %s: %s\n", msg.TopicPartition, value)
+			// }
+			fmt.Printf("Message on %s: %s\n", msg.TopicPartition, value)
 		}
 	}
-
-	fmt.Println(redis.Strings(conn.Do("KEYS", "*")))
 
 	consumer.Close()
 	conn.Close()
 }
 
 //ProcessMsg 使用 redis 对新闻内容实现了去重
-func ProcessMsg(msg string, conn redis.Conn) {
+func ProcessMsg(msg string, conn redis.Conn) bool {
 
 	data := md5.Sum([]byte(msg))    //convert according to md5
 	keyP := fmt.Sprintf("%x", data) //key to be set in redis
@@ -387,57 +419,60 @@ func ProcessMsg(msg string, conn redis.Conn) {
 	checkError("Failed to check key", err)
 
 	if exist, ok := ret.(int64); ok && exist == 1 {
-		_, err := conn.Do("SET", keyP, "")
-		checkError("Failed to set key "+keyP, err)
+		return false
 	}
 
+	_, err = conn.Do("SET", keyP, "")
+	checkError("Failed to set key "+keyP, err)
+
+	fmt.Println(redis.Strings(conn.Do("KEYS", "*")))
+
+	return true
 }
 
-// func StoreInES(string indexName)(bool){
+func StoreInES(indexName string) {
 
-// 	/////initiate a new es client/////
-// 	ctx := context.Background() //create a context object for API calls
-// 	client, err := elastic.NewClient(elastic.SetURL([]string{"http://localhost:9200/"})) //instantiate a new es client object instance
-// 	if err != nil {
-// 		fmt.Printf("Failed to initiate elasticsearch client", err)
-// 	}
+	/////initiate a new es client/////
+	ctx := context.Background()                                                                                      //create a context object for API calls
+	client, err := elastic.NewClient(elastic.SetSniff(false), elastic.SetURL([]string{"http://localhost:9200/"}...)) //instantiate a new es client object instance
+	checkError("Failed to initiate elasticsearch client", err)
 
-// 	exists, err := client.IndexExists(indexName).Do(ctx) //check whether given index exists
-// 	if err != nil {
-// 		fmt.Printf("Index name already exists", err)
-// 	}
-// 	if !exists {
-// 		_, err := client.CreateIndex(indexName).BodyString(mapping).Do(ctx) //create if non-existent
-// 		if err != nil {
-// 			fmt.Printf("Failed to create index", err)
-// 		}
-// 	}
+	exists, err := client.IndexExists(indexName).Do(ctx) //check whether given index exists
+	checkError("Index name already exists", err)
+	if !exists {
+		_, err := client.CreateIndex(indexName).BodyString(mapping).Do(ctx) //create if non-existent
+		checkError("Failed to create index", err)
+	}
 
-// 	/////writes in data/////
-
-// 	for id, content := range newsContent[indexName] {
-// 		doc, _ := client.Index().
-// 		Index(indexName) //writes in index name
-// 		Id(strconv.Itoa(id)). //writes in id
-// 		BodyJson(content). //writes in data content
-// 		Refresh("wait_for").
-// 		Do(ctx) //executes
-
-// 		/////check for successful store/////
-// 		result, _ := client.Get().
-// 			Index(indexName).
-// 			Id(strconv.Itoa(id)).
-// 			Do(ctx)
-
-// 		if result.Found == false{
-// 			fmt.Printf("Failed to store and retrieve data", err)
-// 			return false
-// 		}
-// 	}
-
-// 	return true
-
-// }
+	/////writes in data/////
+	data := newsSummary["WYNews"]
+	for id, content := range data {
+		doc, _ := client.Index().
+			Index(indexName).     //writes in index name
+			Id(strconv.Itoa(id)). //writes in id
+			BodyJson(content).    //writes in data content
+			Refresh("wait_for").
+			Do(ctx) //executes
+		fmt.Printf("Indexed with id=%v, type=%s\n", doc.Id, doc.Type)
+		/////check for successful store/////
+		result, err := client.Get().
+			Index(indexName).
+			Id(strconv.Itoa(id)).
+			Do(ctx)
+		if err != nil {
+			panic(err)
+		}
+		if result.Found {
+			fmt.Printf("Got document %v (version=%d, index=%s, type=%s)\n",
+				result.Id, result.Version, result.Index, result.Type)
+			err := json.Unmarshal(result.Source, &content)
+			if err != nil {
+				panic(err)
+			}
+			fmt.Println(id, content.Source, content.Title)
+		}
+	}
+}
 
 func main() {
 
@@ -455,13 +490,14 @@ func main() {
 	//deliver msg
 	//DeliverMsgToKafka("ZHNews")
 	//DeliverMsgToKafka("TTNews")
-	DeliverMsgToKafka("WYNews")
+	//DeliverMsgToKafka("WYNews")
 
 	//fetch msg
 	//ConsumeMsgFromKafka("ZHNews")
 	//ConsumeMsgFromKafka("TTNews")
-	ConsumeMsgFromKafka("WYNews")
-
+	//ConsumeMsgFromKafka("WYNews")
+	//fmt.Println(newsSummary)
+	StoreInES("wy_news")
 	// fmt.Printf("%+v\n", GetZongHeNews())
 	// fmt.Printf("\n")
 	// fmt.Printf("%+v\n", GetTouTiaoNews())
