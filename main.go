@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/md5"
 	"encoding/json"
@@ -8,6 +9,7 @@ import (
 	"io/ioutil"
 	"net/http"
 	"os"
+	"reflect"
 	"regexp"
 	"strconv"
 	"time"
@@ -21,38 +23,6 @@ var newsSummary map[string][]StdNews
 var newsContent map[string][][]string
 
 //create a mapping for es data storing
-
-// const mapping = `
-// {
-// 	"mappings": {
-// 		"properties": {
-// 			"timestamp": {
-// 				"type": "text"
-// 			},
-// 			"source": {
-// 				"type": "text"
-// 			},
-// 			"title": {
-// 				"type": "text"
-// 			}
-// 			"body": {
-// 				"type": "text"
-// 			}
-// 			"picurl": {
-// 				"type": "text"
-// 			}
-// 			"url": {
-// 				"type": "text"
-// 			}
-// 			"types": {
-// 				"type": "keyword"
-// 			}
-// 			"keywords": {
-// 				"type": "keyword"
-// 			}
-// 		}
-// 	}
-// }`
 const mapping = `
 {
     "mappings": {
@@ -63,7 +33,7 @@ const mapping = `
             "title": {
                 "type": "text"
             },
-            "genres": {
+            "source": {
                 "type": "keyword"
             }
         }
@@ -281,6 +251,27 @@ func GetWangYiNews() {
 
 }
 
+func WangYiTest() {
+	url := "https://3g.163.com/touch/reconstruct/article/list/BAI6RHDKwangning/0-10.html"
+
+	resp, err := http.Get(url) //接口接入、get返回示例
+	checkError("Failed to fetch news", err)
+
+	body, err := ioutil.ReadAll(resp.Body) //转成可读形式(json)
+	resp.Body.Close()                      //断开连接
+	bodyStr := string(body)
+	bodyCut := bodyStr[9 : len(bodyStr)-1]
+	bodyJSON := []byte(bodyCut)
+
+	checkError("Failed to read news", err)
+
+	/////格式转换/////
+	var wangyiNews WangYiNewsRaw                        //创造object
+	err = json.Unmarshal([]byte(bodyJSON), &wangyiNews) //json转换到go
+	checkError("Failed to unmarshal json", err)
+	WYToStd(wangyiNews) //转换到标准格式
+}
+
 //GetNewsContent extracts all the chinese content in string form
 func GetNewsContent(news []StdNews, id int) {
 	chineseRegExp := regexp.MustCompile("[\\p{Han}]+") //正则匹配中文格式
@@ -397,10 +388,7 @@ func ConsumeMsgFromKafka(topic string) {
 			fmt.Printf("Consumer error: %v (%v)\n", err, msg)
 		} else {
 			value := string(msg.Value)
-			//msgList = append(msgList, value)
-			// if ProcessMsg(value, conn) {
-			// 	fmt.Printf("Message on %s: %s\n", msg.TopicPartition, value)
-			// }
+			ProcessMsg(value, conn)
 			fmt.Printf("Message on %s: %s\n", msg.TopicPartition, value)
 		}
 	}
@@ -410,8 +398,8 @@ func ConsumeMsgFromKafka(topic string) {
 }
 
 //ProcessMsg 使用 redis 对新闻内容实现了去重
-func ProcessMsg(msg string, conn redis.Conn) bool {
-
+func ProcessMsg(msg string, conn redis.Conn) {
+	fmt.Println("checking")
 	data := md5.Sum([]byte(msg))    //convert according to md5
 	keyP := fmt.Sprintf("%x", data) //key to be set in redis
 
@@ -419,7 +407,7 @@ func ProcessMsg(msg string, conn redis.Conn) bool {
 	checkError("Failed to check key", err)
 
 	if exist, ok := ret.(int64); ok && exist == 1 {
-		return false
+		return
 	}
 
 	_, err = conn.Do("SET", keyP, "")
@@ -427,9 +415,10 @@ func ProcessMsg(msg string, conn redis.Conn) bool {
 
 	fmt.Println(redis.Strings(conn.Do("KEYS", "*")))
 
-	return true
+	return
 }
 
+//StoreInES stores data in elasticsearch
 func StoreInES(indexName string) {
 
 	/////initiate a new es client/////
@@ -472,6 +461,64 @@ func StoreInES(indexName string) {
 			fmt.Println(id, content.Source, content.Title)
 		}
 	}
+
+	MatchQuery(ctx, client, "网易游戏频道") //search through client on MatchQuery
+	fmt.Println("****")
+}
+
+//MatchQuery search through client on MatchQuery
+func MatchQuery(ctx context.Context, client *elastic.Client, source string) {
+	fmt.Printf("Search: %s ", source)
+	// Term搜索
+	matchQuery := elastic.NewMatchQuery("source", source)
+	searchResult, err := client.Search().
+		Index("wy_news2").
+		Query(matchQuery).
+		//Sort("source", true). // 按id升序排序
+		From(0).Size(10). // 拿前10个结果
+		Pretty(true).
+		Do(ctx) // 执行
+	if err != nil {
+		panic(err)
+	}
+	total := searchResult.TotalHits()
+	fmt.Printf("Found %d subjects\n", total)
+	var std StdNews
+	if total > 0 {
+		for _, item := range searchResult.Each(reflect.TypeOf(std)) {
+			if t, ok := item.(StdNews); ok {
+				fmt.Printf("Found: Subject(source=%d, title=%s)\n", t.Source, t.Title)
+			}
+		}
+
+	} else {
+		fmt.Println("Not found!")
+	}
+}
+
+//QuerySearch search through QueryDSL
+func QuerySearch() {
+	url := "http://localhost:9200/wy_news/_search"
+	query := `{
+		"query":{
+		  "match" : {
+			"source": "网易游戏"
+		  }
+		}
+	  }`
+
+	resp, err := http.Post(url, "application/json", bytes.NewBuffer([]byte(query)))
+	checkError("Failed to fetch data", err)
+
+	body, err := ioutil.ReadAll(resp.Body)
+	resp.Body.Close()
+
+	checkError("Failed to read news", err)
+	fmt.Println(string(body))
+}
+
+func sayhelloName(w http.ResponseWriter, r *http.Request) {
+	WangYiTest()
 }
 
 func main() {
@@ -479,13 +526,15 @@ func main() {
 	newsSummary = make(map[string][]StdNews)  //initiate [newsSummary]
 	newsContent = make(map[string][][]string) //initiate [newsContent]
 
+	http.HandleFunc("/crawlnews", sayhelloName) //设置访问的路由
+	err := http.ListenAndServe(":9090", nil)    //设置监听的端口
+	checkError("Failed to request http service", err)
+
 	//set up news
 	//GetZongHeNews()
 	//GetTouTiaoNews()
-	GetWangYiNews()
-
-	//store data in elasticsearch
-	//go StoreInES()
+	//GetWangYiNews()
+	//WangYiTest()
 
 	//deliver msg
 	//DeliverMsgToKafka("ZHNews")
@@ -495,9 +544,12 @@ func main() {
 	//fetch msg
 	//ConsumeMsgFromKafka("ZHNews")
 	//ConsumeMsgFromKafka("TTNews")
-	//ConsumeMsgFromKafka("WYNews")
-	//fmt.Println(newsSummary)
-	StoreInES("wy_news")
+	//go ConsumeMsgFromKafka("WYNews")
+
+	//store data in ES
+	//StoreInES("wy_news2")
+	//QuerySearch() //search through QueryDSL
+
 	// fmt.Printf("%+v\n", GetZongHeNews())
 	// fmt.Printf("\n")
 	// fmt.Printf("%+v\n", GetTouTiaoNews())
